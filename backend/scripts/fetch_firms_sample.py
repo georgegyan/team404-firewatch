@@ -1,178 +1,149 @@
 
 import os
-from datetime import datetime, timezone
 from io import StringIO
 from pathlib import Path
+from datetime import datetime, timezone
 
 import pandas as pd
 import requests
 from dotenv import load_dotenv
 
 
-# ---------------------------------------------------------
-# 1. Project paths and configuration
-# ---------------------------------------------------------
+# --------------------------------------------------
+# CONFIGURATION
+# --------------------------------------------------
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
-RAW_DATA_DIR = BACKEND_DIR / "data" / "raw"
-ENV_FILE = BACKEND_DIR / ".env"
 
-load_dotenv(ENV_FILE)
+load_dotenv(BACKEND_DIR / ".env")
 
 MAP_KEY = os.getenv("FIRMS_MAP_KEY")
 
-# Approximate Ghana bounding box:
-# west, south, east, north
-GHANA_BBOX = "-3.3,4.5,1.3,11.2"
-
-# NASA FIRMS Area API
-API_BASE_URL = (
-    "https://firms.modaps.eosdis.nasa.gov/api/area/csv"
-)
-
-# We are testing one MODIS source and one VIIRS source.
-SOURCES = {
-    "MODIS": "MODIS_NRT",
-    "VIIRS_SNPP": "VIIRS_SNPP_NRT",
-}
-
-DAY_RANGE = 5
-TIMEOUT_SECONDS = 60
-
-
-# ---------------------------------------------------------
-# 2. Retrieve records from NASA FIRMS
-# ---------------------------------------------------------
-
-def fetch_sensor_data(sensor_name: str, source: str):
-    """Fetch recent fire detections for one FIRMS source."""
-
-    url = (
-        f"{API_BASE_URL}/"
-        f"{MAP_KEY}/"
-        f"{source}/"
-        f"{GHANA_BBOX}/"
-        f"{DAY_RANGE}"
+if not MAP_KEY:
+    raise ValueError(
+        "FIRMS_MAP_KEY not found in backend/.env"
     )
 
-    print(f"\nRequesting {sensor_name} data...")
+BASE_URL = (
+    "https://firms.modaps.eosdis.nasa.gov"
+    "/api/area/csv"
+)
 
-    try:
-        response = requests.get(
-            url,
-            timeout=TIMEOUT_SECONDS,
+# Approximate Ghana bounding box:
+# west, south, east, north
+AREA = "-3.3,4.5,1.3,11.2"
+
+DAY_RANGE = 5
+
+RAW_DIR = BACKEND_DIR / "data" / "raw"
+RAW_DIR.mkdir(parents=True, exist_ok=True)
+
+DATE_SUFFIX = datetime.now(
+    timezone.utc
+).strftime("%Y%m%d")
+
+
+# --------------------------------------------------
+# SENSOR CONFIGURATION
+# --------------------------------------------------
+
+SENSORS = {
+    "MODIS_NRT": "modis_ghana_nrt",
+    "VIIRS_NOAA20_NRT": "viirs_noaa20_ghana_nrt",
+    "VIIRS_NOAA21_NRT": "viirs_noaa21_ghana_nrt",
+}
+
+
+# --------------------------------------------------
+# DATA ACQUISITION
+# --------------------------------------------------
+
+def fetch_sensor_data(source):
+    """Download the latest FIRMS records for one sensor."""
+
+    url = (
+        f"{BASE_URL}/{MAP_KEY}/"
+        f"{source}/{AREA}/{DAY_RANGE}"
+    )
+
+    response = requests.get(
+        url,
+        timeout=60
+    )
+
+    response.raise_for_status()
+
+    if not response.text.strip():
+        raise ValueError(
+            f"{source} returned an empty response."
         )
-        response.raise_for_status()
 
-    except requests.exceptions.Timeout:
-        raise RuntimeError(
-            f"{sensor_name}: NASA FIRMS request timed out."
-        )
+    df = pd.read_csv(StringIO(response.text))
 
-    except requests.exceptions.HTTPError:
-        raise RuntimeError(
-            f"{sensor_name}: NASA FIRMS returned "
-            f"HTTP {response.status_code}. "
-            "Check your MAP_KEY and API access."
-        )
-
-    except requests.exceptions.RequestException as error:
-        raise RuntimeError(
-            f"{sensor_name}: Network request failed: "
-            f"{error.__class__.__name__}"
-        )
-
-    # Parse the returned CSV.
-    try:
-        dataframe = pd.read_csv(StringIO(response.text))
-
-    except (pd.errors.ParserError, pd.errors.EmptyDataError):
-        message = response.text[:250].strip()
-
-        raise RuntimeError(
-            f"{sensor_name}: The API did not return a valid CSV.\n"
-            f"Response preview: {message}"
-        )
-
-    # Check that the response contains the fields we need.
     required_columns = {
         "latitude",
         "longitude",
         "acq_date",
     }
 
-    missing_columns = required_columns.difference(
-        dataframe.columns
-    )
-
-    if missing_columns:
-        raise RuntimeError(
-            f"{sensor_name}: CSV is missing expected columns: "
-            f"{', '.join(sorted(missing_columns))}"
+    if not required_columns.issubset(df.columns):
+        raise ValueError(
+            f"Unexpected response from {source}. "
+            f"Returned columns: {list(df.columns)}"
         )
 
-    print(f"Retrieved {len(dataframe):,} records.")
-
-    return dataframe, response.text
-
-
-# ---------------------------------------------------------
-# 3. Save original CSV responses
-# ---------------------------------------------------------
-
-def save_raw_data(sensor_name: str, csv_text: str):
-    """Save the original NASA CSV response without modification."""
-
-    RAW_DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-    date_stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
-
     filename = (
-        f"{sensor_name.lower()}_ghana_nrt_"
-        f"last_{DAY_RANGE}_days_{date_stamp}.csv"
+        f"{SENSORS[source]}_"
+        f"last_{DAY_RANGE}_days_"
+        f"{DATE_SUFFIX}.csv"
     )
 
-    output_path = RAW_DATA_DIR / filename
+    output_path = RAW_DIR / filename
 
+    # Preserve the original CSV response.
     output_path.write_text(
-        csv_text,
-        encoding="utf-8",
+        response.text,
+        encoding="utf-8"
     )
+
+    return df, output_path
+
+
+# --------------------------------------------------
+# REPORTING
+# --------------------------------------------------
+
+def display_report(source, df, output_path):
+
+    print("\n" + "-" * 55)
+    print(f"{source} DATA REPORT")
+    print("-" * 55)
+
+    print(f"Total detections: {len(df)}")
 
     print(f"Saved raw file: {output_path}")
 
-    return output_path
-
-
-# ---------------------------------------------------------
-# 4. Display a simple data report
-# ---------------------------------------------------------
-
-def display_report(sensor_name: str, dataframe: pd.DataFrame):
-    print(f"\n{'-' * 55}")
-    print(f"{sensor_name} DATA REPORT")
-    print(f"{'-' * 55}")
-
-    print(f"Total detections: {len(dataframe):,}")
-
-    if dataframe.empty:
-        print("No detections were returned for this period.")
+    if df.empty:
+        print("No detections returned for this period.")
         return
 
-    print(
-        "Date range: "
-        f"{dataframe['acq_date'].min()} to "
-        f"{dataframe['acq_date'].max()}"
-    )
+    dates = pd.to_datetime(
+        df["acq_date"],
+        errors="coerce"
+    ).dropna()
+
+    if not dates.empty:
+        print(
+            f"Date range: "
+            f"{dates.min().date()} to "
+            f"{dates.max().date()}"
+        )
 
     print("\nAvailable columns:")
-    print(", ".join(dataframe.columns))
-
-    print("\nFirst five records:")
+    print(", ".join(df.columns))
 
     preview_columns = [
-        column
-        for column in [
+        col for col in [
             "latitude",
             "longitude",
             "acq_date",
@@ -181,65 +152,83 @@ def display_report(sensor_name: str, dataframe: pd.DataFrame):
             "confidence",
             "frp",
         ]
-        if column in dataframe.columns
+        if col in df.columns
     ]
 
+    print("\nFirst five records:")
     print(
-        dataframe[preview_columns]
+        df[preview_columns]
         .head()
         .to_string(index=False)
     )
 
 
-# ---------------------------------------------------------
-# 5. Main program
-# ---------------------------------------------------------
+# --------------------------------------------------
+# MAIN PROGRAM
+# --------------------------------------------------
 
 def main():
+
     print("=" * 55)
     print("TERRASIGNAL FIREWATCH")
-    print("NASA FIRMS DATA ACQUISITION TEST")
+    print("NASA FIRMS DATA ACQUISITION")
     print("=" * 55)
 
-    if not MAP_KEY:
-        raise RuntimeError(
-            "FIRMS_MAP_KEY was not found.\n"
-            f"Check that your key is saved in: {ENV_FILE}"
-        )
-
     print("MAP_KEY loaded successfully.")
-    print(f"Study area: Ghana (approximate bounding box)")
+    print("Study area: Ghana (approximate bounding box)")
     print(f"Period: Latest {DAY_RANGE} days")
     print("Data type: Near Real-Time (NRT)")
 
     results = {}
 
-    for sensor_name, source in SOURCES.items():
-        dataframe, csv_text = fetch_sensor_data(
-            sensor_name,
-            source,
-        )
+    for source in SENSORS:
 
-        save_raw_data(sensor_name, csv_text)
+        print(f"\nRequesting {source} data...")
 
-        display_report(sensor_name, dataframe)
+        try:
+            df, output_path = fetch_sensor_data(source)
 
-        results[sensor_name] = len(dataframe)
+            results[source] = len(df)
+
+            print(f"Retrieved {len(df)} records.")
+
+            display_report(
+                source,
+                df,
+                output_path
+            )
+
+        except requests.RequestException as error:
+            print(f"Network/API error for {source}: {error}")
+            results[source] = None
+
+        except Exception as error:
+            print(f"Error processing {source}: {error}")
+            results[source] = None
 
     print("\n" + "=" * 55)
     print("ACQUISITION SUMMARY")
     print("=" * 55)
 
-    for sensor_name, count in results.items():
-        print(f"{sensor_name}: {count:,} detections")
+    for source, count in results.items():
 
-    print("\nBoth sensor requests completed successfully.")
-    print("Original CSV files are stored in backend/data/raw/")
+        if count is None:
+            print(f"{source}: FAILED")
+        else:
+            print(f"{source}: {count} detections")
+
+    print("\nSuomi-NPP note:")
+    print(
+        "Its latest available NRT date was "
+        "2 November 2026, so it is excluded "
+        "from this latest-five-day test."
+    )
+
+    print("\nOriginal CSV files are stored in:")
+    print(RAW_DIR)
+
+    print("\nAcquisition test completed.")
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except RuntimeError as error:
-        print(f"\nERROR: {error}")
-        raise SystemExit(1)
+    main()
