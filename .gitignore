@@ -218,3 +218,19 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+@"
+
+# FireWatch local environment
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+
+# Local NASA datasets
+backend/data/raw/*
+backend/data/processed/*
+!backend/data/raw/.gitkeep
+!backend/data/processed/.gitkeep
+"@ | Add-Content .gitignore
